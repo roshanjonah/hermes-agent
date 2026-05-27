@@ -303,6 +303,8 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    delivery_subject: Optional[str] = None,
+    delivery_format: Optional[str] = None,
     no_agent: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
@@ -369,6 +371,8 @@ def cronjob(
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
+                delivery_subject=_normalize_optional_job_value(delivery_subject),
+                delivery_format=_normalize_optional_job_value(delivery_format),
                 no_agent=_no_agent,
             )
             return json.dumps(
@@ -503,6 +507,10 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if delivery_subject is not None:
+                updates["delivery_subject"] = _normalize_optional_job_value(delivery_subject) or None
+            if delivery_format is not None:
+                updates["delivery_format"] = _normalize_optional_job_value(delivery_format) or None
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -656,6 +664,24 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "delivery_subject": {
+                "type": "string",
+                "description": (
+                    "Optional subject template for delivery platforms that support subjects, currently email. "
+                    "Supported placeholders: {job_name}, {job_id}, {date}, {time}, {datetime}, {weekday}, {iso_date}. "
+                    "Example: 'Morning Report - {date}'. On update, pass an empty string to clear."
+                ),
+            },
+            "delivery_format": {
+                "type": "string",
+                "enum": ["plain", "markdown", "html"],
+                "description": (
+                    "Optional body format hint for delivery platforms that support rich rendering, currently email. "
+                    "'plain' preserves text-only delivery, 'markdown' sends text/plain plus rendered text/html, "
+                    "and 'html' treats the final response as HTML while also sending the plain-text fallback. "
+                    "Use 'markdown' for reports written in Markdown tables/headings. On update, pass an empty string to clear."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -710,6 +736,8 @@ registry.register(
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
+        delivery_subject=args.get("delivery_subject"),
+        delivery_format=args.get("delivery_format"),
         no_agent=args.get("no_agent"),
         task_id=kw.get("task_id"),
     ))(),

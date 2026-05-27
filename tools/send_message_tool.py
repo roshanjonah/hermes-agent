@@ -435,6 +435,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    metadata=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -461,8 +462,14 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = {"thread_id": thread_id} if thread_id else None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                send_metadata = dict(metadata or {})
+                if thread_id and "thread_id" not in send_metadata:
+                    send_metadata["thread_id"] = thread_id
+                result = await adapter.send(
+                    chat_id=chat_id,
+                    content=chunk,
+                    metadata=send_metadata or None,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -515,7 +522,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, metadata=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -542,6 +549,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _feishu_available = False
 
     media_files = media_files or []
+    metadata = dict(metadata or {})
 
     if platform == Platform.SLACK and message:
         try:
@@ -709,7 +717,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
-            result = await _send_email(pconfig.extra, chat_id, chunk)
+            result = await _send_email(pconfig.extra, chat_id, chunk, metadata=metadata)
         elif platform == Platform.SMS:
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
         elif platform == Platform.MATTERMOST:
@@ -741,6 +749,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                metadata=metadata,
             )
 
         if isinstance(result, dict) and result.get("error"):
@@ -1356,11 +1365,14 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         return _error(f"Signal send failed: {e}")
 
 
-async def _send_email(extra, chat_id, message):
+async def _send_email(extra, chat_id, message, metadata=None):
     """Send via SMTP (one-shot, no persistent connection needed)."""
     import smtplib
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
+    from gateway.email_message import (
+        build_outgoing_email_message,
+        clean_email_subject,
+        html_body_from_metadata,
+    )
 
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
     password = os.getenv("EMAIL_PASSWORD", "")
@@ -1374,11 +1386,15 @@ async def _send_email(extra, chat_id, message):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
-        msg["From"] = address
-        msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
-        msg["Date"] = formatdate(localtime=True)
+        metadata = dict(metadata or {})
+        subject = clean_email_subject(metadata.get("subject") or "Hermes Agent")
+        msg = build_outgoing_email_message(
+            from_addr=address,
+            to_addr=chat_id,
+            subject=subject,
+            body=message,
+            html_body=html_body_from_metadata(message, metadata),
+        )
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=ssl.create_default_context())

@@ -486,6 +486,50 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+class _SafeSubjectMap(dict):
+    """Leave unknown subject-template placeholders untouched."""
+
+    def __missing__(self, key):
+        return "{" + str(key) + "}"
+
+
+def _format_delivery_subject(template: str, job: dict) -> str:
+    now = _hermes_now()
+    values = _SafeSubjectMap(
+        job_name=str(job.get("name") or job.get("id") or "cron job"),
+        job_id=str(job.get("id") or ""),
+        date=f"{now.strftime('%A')}, {now.day} {now.strftime('%B %Y')}",
+        time=now.strftime("%H:%M"),
+        datetime=now.strftime("%A, %d %B %Y %H:%M"),
+        weekday=now.strftime("%A"),
+        iso_date=now.date().isoformat(),
+    )
+    try:
+        subject = str(template).format_map(values)
+    except Exception:
+        subject = str(template)
+    return " ".join(subject.split())
+
+
+def _delivery_metadata_for_target(job: dict, platform_name: str, thread_id: Optional[str]) -> Optional[dict]:
+    metadata = {}
+    if thread_id:
+        metadata["thread_id"] = thread_id
+
+    # Subject/body-format hints are currently meaningful only for email. Keep
+    # other platform metadata unchanged so topic-routing adapters see the same
+    # shape they had before.
+    if platform_name.lower() == "email":
+        subject_template = str(job.get("delivery_subject") or "").strip()
+        if subject_template:
+            metadata["subject"] = _format_delivery_subject(subject_template, job)
+        delivery_format = str(job.get("delivery_format") or "").strip().lower()
+        if delivery_format:
+            metadata["format"] = delivery_format
+
+    return metadata or None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -585,8 +629,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        send_metadata = _delivery_metadata_for_target(job, platform_name, thread_id)
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -636,7 +680,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                metadata=send_metadata,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -646,7 +698,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(
+                        asyncio.run,
+                        _send_to_platform(
+                            platform,
+                            pconfig,
+                            chat_id,
+                            cleaned_delivery_content,
+                            thread_id=thread_id,
+                            media_files=media_files,
+                            metadata=send_metadata,
+                        ),
+                    )
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"

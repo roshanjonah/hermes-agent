@@ -607,6 +607,50 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
 
+    def test_explicit_subject_metadata_does_not_add_re_prefix(self):
+        """Explicit delivery subjects are sent as-is for cron/report emails."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "Report body",
+                None,
+                {"subject": "Morning Report - Wednesday"},
+            )
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "Morning Report - Wednesday")
+
+    def test_markdown_metadata_sends_html_alternative(self):
+        """Markdown delivery sends plain text plus rendered HTML."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "## Weather\n\n| Time | Forecast |\n| --- | --- |\n| Noon | Rain |",
+                None,
+                {"subject": "Morning Report", "format": "markdown"},
+            )
+
+            sent_msg = mock_server.send_message.call_args[0][0]
+            self.assertTrue(sent_msg.is_multipart())
+            plain = sent_msg.get_body(preferencelist=("plain",))
+            html = sent_msg.get_body(preferencelist=("html",))
+            self.assertIsNotNone(plain)
+            self.assertIsNotNone(html)
+            self.assertIn("## Weather", plain.get_content())
+            html_content = html.get_content()
+            self.assertIn("<h2>Weather</h2>", html_content)
+            self.assertIn("<table>", html_content)
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""

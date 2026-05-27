@@ -79,6 +79,33 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     return str(value)
 
 
+def _normalize_delivery_format(value: Optional[str]) -> Optional[str]:
+    """Normalize optional cron delivery body format."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    aliases = {
+        "md": "markdown",
+        "text/markdown": "markdown",
+        "text/html": "html",
+        "text/plain": "plain",
+    }
+    text = aliases.get(text, text)
+    if text not in {"plain", "html", "markdown"}:
+        raise ValueError("delivery_format must be one of: plain, html, markdown")
+    return text
+
+
+def _normalize_delivery_subject(value: Optional[str]) -> Optional[str]:
+    """Normalize optional cron delivery subject template."""
+    if value is None:
+        return None
+    text = re.sub(r"[\r\n\t ]+", " ", str(value)).strip()
+    return text or None
+
+
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     display = _coerce_job_text(job.get("schedule_display")).strip()
     if display:
@@ -127,6 +154,11 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+    normalized["delivery_subject"] = _normalize_delivery_subject(normalized.get("delivery_subject"))
+    try:
+        normalized["delivery_format"] = _normalize_delivery_format(normalized.get("delivery_format"))
+    except ValueError:
+        normalized["delivery_format"] = None
 
     return normalized
 
@@ -495,6 +527,8 @@ def create_job(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    delivery_subject: Optional[str] = None,
+    delivery_format: Optional[str] = None,
     no_agent: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -536,6 +570,12 @@ def create_job(
                 With ``no_agent=True``, ``workdir`` is still applied as the
                 script's cwd so relative paths inside the script behave
                 predictably.
+        delivery_subject: Optional delivery subject template for platforms
+                that support subjects, currently email. Supports scheduler
+                placeholders like ``{job_name}``, ``{date}``, and ``{time}``.
+        delivery_format: Optional body format hint for platforms that support
+                rich text, currently email. One of ``plain``, ``html``, or
+                ``markdown``.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
@@ -573,6 +613,8 @@ def create_job(
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
+    normalized_delivery_subject = _normalize_delivery_subject(delivery_subject)
+    normalized_delivery_format = _normalize_delivery_format(delivery_format)
     normalized_no_agent = bool(no_agent)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -627,6 +669,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "delivery_subject": normalized_delivery_subject,
+        "delivery_format": normalized_delivery_format,
     }
 
     jobs = load_jobs()
@@ -706,6 +750,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["workdir"] = None
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
+
+        if "delivery_subject" in updates:
+            updates["delivery_subject"] = _normalize_delivery_subject(updates["delivery_subject"])
+
+        if "delivery_format" in updates:
+            updates["delivery_format"] = _normalize_delivery_format(updates["delivery_format"])
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

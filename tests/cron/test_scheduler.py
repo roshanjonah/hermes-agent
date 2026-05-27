@@ -2331,6 +2331,61 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert result is None, f"expected successful delivery, got error: {result!r}"
         standalone_send.assert_awaited_once()
 
+    def test_email_delivery_metadata_includes_subject_and_format(self):
+        """Cron email jobs pass subject/format metadata to the email adapter."""
+        from concurrent.futures import Future
+        from datetime import datetime, timezone
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="42"))
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "morning-job",
+            "name": "morning-report",
+            "deliver": "email:user@test.com",
+            "delivery_subject": "Morning Report - {date}",
+            "delivery_format": "markdown",
+        }
+
+        completed_future = Future()
+        completed_future.set_result(SendResult(success=True, message_id="42"))
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return completed_future
+
+        fixed_now = datetime(2026, 5, 27, 5, 0, tzinfo=timezone.utc)
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._hermes_now", return_value=fixed_now), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                "## Weather\n\nRain.",
+                adapters={Platform.EMAIL: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send.assert_called_once_with(
+            "user@test.com",
+            "## Weather\n\nRain.",
+            metadata={
+                "subject": "Morning Report - Wednesday, 27 May 2026",
+                "format": "markdown",
+            },
+        )
+
 
 class TestSendMediaTimeoutCancelsFuture:
     """Same orphan-coroutine guarantee for _send_media_via_adapter's
