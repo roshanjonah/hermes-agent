@@ -11,6 +11,7 @@ Environment variables:
     EMAIL_SMTP_PORT     — SMTP server port (default: 587)
     EMAIL_ADDRESS       — Email address for the agent
     EMAIL_PASSWORD      — Email password or app-specific password
+    EMAIL_FROM_NAME     — Optional display name for outbound From header
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 """
@@ -44,6 +45,7 @@ from gateway.platforms.base import (
 from gateway.config import Platform, PlatformConfig
 from gateway.email_message import (
     build_outgoing_email_message,
+    format_email_from_header,
     html_body_from_metadata,
     metadata_text,
     reply_subject,
@@ -70,6 +72,11 @@ MAX_MESSAGE_LENGTH = 50_000
 
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
+def _email_from_name_from_env() -> str:
+    return os.getenv("EMAIL_FROM_NAME", "").strip()
+
 
 def _send_imap_id(imap: "imaplib.IMAP4") -> None:
     """Send RFC 2971 IMAP ID command identifying this client.
@@ -255,6 +262,7 @@ class EmailAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.EMAIL)
 
         self._address = os.getenv("EMAIL_ADDRESS", "")
+        self._from_name = _email_from_name_from_env()
         self._password = os.getenv("EMAIL_PASSWORD", "")
         self._imap_host = os.getenv("EMAIL_IMAP_HOST", "")
         self._imap_port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
@@ -278,6 +286,9 @@ class EmailAdapter(BasePlatformAdapter):
         self._thread_context: Dict[str, Dict[str, str]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
+
+    def _from_header(self) -> str:
+        return format_email_from_header(self._address, self._from_name)
 
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
@@ -547,6 +558,7 @@ class EmailAdapter(BasePlatformAdapter):
             body=body,
             html_body=html_body_from_metadata(body, metadata),
             in_reply_to=original_msg_id,
+            from_name=metadata_text(metadata, "from_name") or self._from_name,
         )
 
         smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
@@ -638,7 +650,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_header()
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
@@ -716,7 +728,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_header()
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})

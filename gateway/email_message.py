@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 from email.message import EmailMessage
-from email.utils import formatdate
+from email.utils import formataddr, formatdate
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,7 @@ th { background: #f6f8fa; font-weight: 600; }
 pre, code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 pre { background: #f6f8fa; padding: 12px; overflow-x: auto; }
 blockquote { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid #d0d7de; color: #57606a; }
+a { color: #1a73e8; }
 """.strip()
 
 
@@ -46,6 +47,12 @@ def metadata_text(metadata: Optional[Dict[str, Any]], key: str) -> Optional[str]
         return None
     text = str(value)
     return text if text else None
+
+
+def format_email_from_header(from_addr: str, from_name: Optional[str] = None) -> str:
+    """Format an email From header with an optional display name."""
+    clean_from_name = str(from_name or "").strip()
+    return formataddr((clean_from_name, from_addr)) if clean_from_name else from_addr
 
 
 def wrap_email_html(fragment: str) -> str:
@@ -105,10 +112,11 @@ def build_outgoing_email_message(
     body: str,
     html_body: Optional[str] = None,
     in_reply_to: Optional[str] = None,
+    from_name: Optional[str] = None,
 ) -> EmailMessage:
     """Build a text/plain email, optionally with a text/html alternative."""
     msg = EmailMessage()
-    msg["From"] = from_addr
+    msg["From"] = format_email_from_header(from_addr, from_name)
     msg["To"] = to_addr
     msg["Subject"] = clean_email_subject(subject)
     if in_reply_to:

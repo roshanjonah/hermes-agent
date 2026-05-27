@@ -1375,6 +1375,11 @@ async def _send_email(extra, chat_id, message, metadata=None):
     )
 
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
+    from_name = (
+        (metadata or {}).get("from_name")
+        or extra.get("from_name")
+        or os.getenv("EMAIL_FROM_NAME", "").strip()
+    )
     password = os.getenv("EMAIL_PASSWORD", "")
     smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
     try:
@@ -1394,6 +1399,7 @@ async def _send_email(extra, chat_id, message, metadata=None):
             subject=subject,
             body=message,
             html_body=html_body_from_metadata(message, metadata),
+            from_name=str(from_name),
         )
 
         server = smtplib.SMTP(smtp_host, smtp_port)

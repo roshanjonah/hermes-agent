@@ -514,14 +514,16 @@ class TestDispatchMessage(unittest.TestCase):
 class TestThreadContext(unittest.TestCase):
     """Test email reply threading logic."""
 
-    def _make_adapter(self):
+    def _make_adapter(self, extra_env=None):
         from gateway.config import PlatformConfig
-        with patch.dict(os.environ, {
+        env = {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
-        }):
+        }
+        env.update(extra_env or {})
+        with patch.dict(os.environ, env):
             from gateway.platforms.email import EmailAdapter
             adapter = EmailAdapter(PlatformConfig(enabled=True))
         return adapter
@@ -650,6 +652,41 @@ class TestThreadContext(unittest.TestCase):
             html_content = html.get_content()
             self.assertIn("<h2>Weather</h2>", html_content)
             self.assertIn("<table>", html_content)
+
+    def test_markdown_links_render_blue_html_links(self):
+        """Markdown links should be clickable and blue in HTML reports."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "## Major news\n\n- [Example story](https://example.com/story)",
+                None,
+                {"subject": "Morning Report", "format": "markdown"},
+            )
+
+            sent_msg = mock_server.send_message.call_args[0][0]
+            html = sent_msg.get_body(preferencelist=("html",))
+            self.assertIsNotNone(html)
+            html_content = html.get_content()
+            self.assertIn('href="https://example.com/story"', html_content)
+            self.assertIn("a { color: #1a73e8; }", html_content)
+
+    def test_from_name_env_sets_display_from_header(self):
+        """EMAIL_FROM_NAME should set the outbound display name."""
+        adapter = self._make_adapter({"EMAIL_FROM_NAME": "Hermes Agent"})
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("user@test.com", "Report body", None)
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["From"], "Hermes Agent <hermes@test.com>")
 
 
 class TestSendMethods(unittest.TestCase):
@@ -1001,7 +1038,7 @@ class TestSendEmailStandalone(unittest.TestCase):
         "EMAIL_PASSWORD": "secret",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
-    })
+    }, clear=True)
     def test_send_email_tool_success(self):
         """_send_email should use verified STARTTLS when sending."""
         import asyncio
@@ -1030,7 +1067,31 @@ class TestSendEmailStandalone(unittest.TestCase):
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
         "EMAIL_SMTP_HOST": "smtp.test.com",
-    })
+        "EMAIL_SMTP_PORT": "587",
+        "EMAIL_FROM_NAME": "Hermes Agent",
+    }, clear=True)
+    def test_send_email_tool_from_name_env(self):
+        """Standalone email sender should use EMAIL_FROM_NAME."""
+        import asyncio
+        from tools.send_message_tool import _send_email
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(
+                _send_email({"address": "hermes@test.com", "smtp_host": "smtp.test.com"}, "user@test.com", "Hello")
+            )
+
+            self.assertTrue(result["success"])
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["From"], "Hermes Agent <hermes@test.com>")
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+    }, clear=True)
     def test_send_email_tool_failure(self):
         """SMTP failure should return error dict."""
         import asyncio
