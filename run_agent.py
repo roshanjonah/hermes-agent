@@ -83,6 +83,26 @@ def _load_openai_cls() -> type:
     return _OPENAI_CLS_CACHE
 
 
+def _is_openai_responses_output_none_typeerror(exc: BaseException) -> bool:
+    """Detect the OpenAI SDK stream parser bug for terminal output=None frames."""
+    if not isinstance(exc, TypeError):
+        return False
+    if str(exc) != "'NoneType' object is not iterable":
+        return False
+
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        filename = code.co_filename.replace("\\", "/")
+        if (
+            filename.endswith("openai/lib/_parsing/_responses.py")
+            and code.co_name == "parse_response"
+        ):
+            return True
+        tb = tb.tb_next
+    return False
+
+
 class _OpenAIProxy:
     """Module-level proxy that looks like ``openai.OpenAI`` but imports lazily."""
 
@@ -7160,7 +7180,7 @@ class AIAgent:
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             final_response.output = list(collected_output_items)
                             logger.debug(
@@ -7244,6 +7264,48 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError as exc:
+                if _is_openai_responses_output_none_typeerror(exc):
+                    if collected_output_items:
+                        logger.debug(
+                            "Responses stream parser hit terminal output=None; "
+                            "returning %d collected output items without retry. %s err=%s",
+                            len(collected_output_items),
+                            self._client_log_context(),
+                            exc,
+                        )
+                        return SimpleNamespace(
+                            output=list(collected_output_items),
+                            status="completed",
+                            model=api_kwargs.get("model"),
+                        )
+                    if self._codex_streamed_text_parts and not has_tool_calls:
+                        assembled = "".join(self._codex_streamed_text_parts)
+                        logger.debug(
+                            "Responses stream parser hit terminal output=None; "
+                            "synthesizing output from %d deltas without retry. %s err=%s",
+                            len(self._codex_streamed_text_parts),
+                            self._client_log_context(),
+                            exc,
+                        )
+                        return SimpleNamespace(
+                            output=[SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )],
+                            status="completed",
+                            model=api_kwargs.get("model"),
+                        )
+                    logger.debug(
+                        "Responses stream parser hit terminal output=None; "
+                        "falling back to create(stream=True). %s err=%s",
+                        self._client_log_context(),
+                        exc,
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                raise
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -7292,7 +7354,7 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(

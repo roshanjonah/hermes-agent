@@ -198,6 +198,20 @@ def _codex_request_kwargs():
     }
 
 
+def _raise_openai_parse_output_none_typeerror():
+    source = (
+        "def parse_response():\n"
+        "    raise TypeError(\"'NoneType' object is not iterable\")\n"
+        "parse_response()\n"
+    )
+    code = compile(
+        source,
+        "/venv/lib/python3.12/site-packages/openai/lib/_parsing/_responses.py",
+        "exec",
+    )
+    exec(code, {})
+
+
 def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
@@ -483,6 +497,192 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_falls_back_on_openai_output_none_parser_typeerror(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="codex-ok"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(output=None, status="completed"),
+            ),
+        ]
+    )
+
+    class _OpenAIParserBugStream(_FakeResponsesStream):
+        def __iter__(self):
+            _raise_openai_parse_output_none_typeerror()
+            return iter(())
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _OpenAIParserBugStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 1}
+    assert create_stream.closed is True
+    assert response.output[0].content[0].text == "codex-ok"
+
+
+def test_run_codex_stream_does_not_fallback_on_unrelated_typeerror(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _BadRequestStream(_FakeResponsesStream):
+        def __iter__(self):
+            raise TypeError("unexpected keyword argument 'bad'")
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _BadRequestStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not be used")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+
+
+def test_run_codex_stream_synthesizes_text_on_parser_typeerror_after_deltas(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _ParserBugAfterDeltasStream(_FakeResponsesStream):
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="codex-")
+            yield SimpleNamespace(type="response.output_text.delta", delta="ok")
+            _raise_openai_parse_output_none_typeerror()
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _ParserBugAfterDeltasStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not be used")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+    assert response.output[0].content[0].text == "codex-ok"
+
+
+def test_run_codex_stream_returns_collected_items_on_parser_typeerror(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    output_item = SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text="collected codex-ok")],
+    )
+
+    class _ParserBugAfterOutputItemStream(_FakeResponsesStream):
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_item.done", item=output_item)
+            _raise_openai_parse_output_none_typeerror()
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _ParserBugAfterOutputItemStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not be used")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+    assert response.output == [output_item]
+
+
+def test_run_codex_stream_backfills_final_response_output_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    output_item = SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text="backfilled direct stream")],
+    )
+
+    class _OutputNoneFinalStream(_FakeResponsesStream):
+        def __iter__(self):
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_item.done", item=output_item),
+                    SimpleNamespace(type="response.completed"),
+                ]
+            )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _OutputNoneFinalStream(
+                final_response=SimpleNamespace(output=None, status="completed")
+            ),
+            create=lambda **kwargs: _codex_message_response("unused"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.output == [output_item]
+
+
+def test_codex_create_stream_fallback_synthesizes_output_when_terminal_output_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="codex-ok"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(output=None, status="completed"),
+            ),
+        ]
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: create_stream)
+    )
+
+    response = agent._run_codex_create_stream_fallback(_codex_request_kwargs())
+
+    assert create_stream.closed is True
+    assert response.output[0].content[0].text == "codex-ok"
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):
