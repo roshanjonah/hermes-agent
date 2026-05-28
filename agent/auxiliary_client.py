@@ -115,6 +115,26 @@ def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
         return False
 
 
+def _is_openai_responses_output_none_typeerror(exc: BaseException) -> bool:
+    """Detect the OpenAI SDK stream parser bug for terminal output=None frames."""
+    if not isinstance(exc, TypeError):
+        return False
+    if str(exc) != "'NoneType' object is not iterable":
+        return False
+
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        filename = code.co_filename.replace("\\", "/")
+        if (
+            filename.endswith("openai/lib/_parsing/_responses.py")
+            and code.co_name == "parse_response"
+        ):
+            return True
+        tb = tb.tb_next
+    return False
+
+
 def _extract_url_query_params(url: str):
     """Extract query params from URL, return (clean_url, default_query dict or None)."""
     parsed = urlparse(url)
@@ -626,6 +646,71 @@ def _convert_content_for_responses(content: Any) -> Any:
     return converted or ""
 
 
+def _codex_event_get(obj: Any, key: str, default: Any = None) -> Any:
+    value = getattr(obj, key, None)
+    if value is None and isinstance(obj, dict):
+        value = obj.get(key, default)
+    return value if value is not None else default
+
+
+def _codex_text_message_output(text: str) -> List[Any]:
+    return [SimpleNamespace(
+        type="message", role="assistant", status="completed",
+        content=[SimpleNamespace(type="output_text", text=text)],
+    )]
+
+
+def _set_codex_output(response: Any, output: List[Any]) -> None:
+    if isinstance(response, dict):
+        response["output"] = output
+    else:
+        response.output = output
+
+
+def _backfill_codex_output(
+    response: Any,
+    output_items: List[Any],
+    text_deltas: List[str],
+    *,
+    has_function_calls: bool,
+) -> None:
+    output = _codex_event_get(response, "output")
+    if output is not None and not (isinstance(output, list) and not output):
+        return
+    if output_items:
+        _set_codex_output(response, list(output_items))
+    elif text_deltas and not has_function_calls:
+        _set_codex_output(response, _codex_text_message_output("".join(text_deltas)))
+
+
+def _collect_codex_response_events(
+    events: Any,
+    *,
+    output_items: List[Any],
+    text_deltas: List[str],
+    check_cancelled=None,
+    has_function_calls: bool = False,
+) -> Tuple[Any, bool]:
+    terminal_response = None
+    for event in events:
+        if check_cancelled is not None:
+            check_cancelled()
+        event_type = _codex_event_get(event, "type", "")
+        if event_type == "response.output_item.done":
+            item = _codex_event_get(event, "item")
+            if item is not None:
+                output_items.append(item)
+        elif event_type and "output_text.delta" in event_type:
+            delta = _codex_event_get(event, "delta", "")
+            if delta:
+                text_deltas.append(delta)
+        elif event_type and "function_call" in event_type:
+            has_function_calls = True
+        elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+            terminal_response = _codex_event_get(event, "response")
+    return terminal_response, has_function_calls
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -633,6 +718,53 @@ class _CodexCompletionsAdapter:
     def __init__(self, real_client: OpenAI, model: str):
         self._client = real_client
         self._model = model
+
+    def _run_create_stream_fallback(
+        self,
+        resp_kwargs: Dict[str, Any],
+        *,
+        has_function_calls: bool = False,
+        check_cancelled=None,
+    ) -> Any:
+        fallback_kwargs = dict(resp_kwargs)
+        fallback_kwargs["stream"] = True
+        if check_cancelled is not None:
+            check_cancelled()
+        stream_or_response = self._client.responses.create(**fallback_kwargs)
+        if check_cancelled is not None:
+            check_cancelled()
+        if hasattr(stream_or_response, "output"):
+            return stream_or_response
+        if not hasattr(stream_or_response, "__iter__"):
+            return stream_or_response
+
+        collected_output_items: List[Any] = []
+        collected_text_deltas: List[str] = []
+        try:
+            terminal_response, has_function_calls = _collect_codex_response_events(
+                stream_or_response,
+                output_items=collected_output_items,
+                text_deltas=collected_text_deltas,
+                check_cancelled=check_cancelled,
+                has_function_calls=has_function_calls,
+            )
+        finally:
+            close = getattr(stream_or_response, "close", None)
+            if callable(close):
+                close()
+
+        if check_cancelled is not None:
+            check_cancelled()
+        if terminal_response is None:
+            raise RuntimeError("Codex auxiliary create(stream=True) fallback did not emit a terminal response.")
+
+        _backfill_codex_output(
+            terminal_response,
+            collected_output_items,
+            collected_text_deltas,
+            has_function_calls=has_function_calls,
+        )
+        return terminal_response
 
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
@@ -780,69 +912,73 @@ class _CodexCompletionsAdapter:
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+            try:
+                with self._client.responses.stream(**resp_kwargs) as stream:
+                    _, has_function_calls = _collect_codex_response_events(
+                        stream,
+                        output_items=collected_output_items,
+                        text_deltas=collected_text_deltas,
+                        check_cancelled=_check_cancelled,
+                        has_function_calls=has_function_calls,
+                    )
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
-
-            # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+                    final = stream.get_final_response()
+            except TypeError as exc:
+                if not _is_openai_responses_output_none_typeerror(exc):
+                    raise
                 if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
+                    final = SimpleNamespace(
+                        output=list(collected_output_items),
+                        status="completed",
+                        model=model,
+                        usage=None,
                     )
                 elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
+                    final = SimpleNamespace(
+                        output=_codex_text_message_output("".join(collected_text_deltas)),
+                        status="completed",
+                        model=model,
+                        usage=None,
                     )
+                else:
+                    logger.debug(
+                        "Codex auxiliary stream parser hit terminal output=None; "
+                        "falling back to create(stream=True): %s",
+                        exc,
+                    )
+                    final = self._run_create_stream_fallback(
+                        resp_kwargs,
+                        has_function_calls=has_function_calls,
+                        check_cancelled=_check_cancelled,
+                    )
+
+            if isinstance(final, dict):
+                final = SimpleNamespace(**final)
+
+            _backfill_codex_output(
+                final,
+                collected_output_items,
+                collected_text_deltas,
+                has_function_calls=has_function_calls,
+            )
 
             # Extract text and tool calls from the Responses output.
             # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
-            # so use a helper that handles both shapes.
-            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
-                val = getattr(obj, key, None)
-                if val is None and isinstance(obj, dict):
-                    val = obj.get(key, default)
-                return val if val is not None else default
-
+            # so use the shared helper that handles both shapes.
             for item in getattr(final, "output", []):
-                item_type = _item_get(item, "type")
+                item_type = _codex_event_get(item, "type")
                 if item_type == "message":
-                    for part in (_item_get(item, "content") or []):
-                        ptype = _item_get(part, "type")
+                    for part in (_codex_event_get(item, "content") or []):
+                        ptype = _codex_event_get(part, "type")
                         if ptype in {"output_text", "text"}:
-                            text_parts.append(_item_get(part, "text", ""))
+                            text_parts.append(_codex_event_get(part, "text", ""))
                 elif item_type == "function_call":
                     tool_calls_raw.append(SimpleNamespace(
-                        id=_item_get(item, "call_id", ""),
+                        id=_codex_event_get(item, "call_id", ""),
                         type="function",
                         function=SimpleNamespace(
-                            name=_item_get(item, "name", ""),
-                            arguments=_item_get(item, "arguments", "{}"),
+                            name=_codex_event_get(item, "name", ""),
+                            arguments=_codex_event_get(item, "arguments", "{}"),
                         ),
                     ))
 

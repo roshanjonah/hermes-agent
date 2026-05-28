@@ -31,6 +31,20 @@ from agent.auxiliary_client import (
 )
 
 
+def _raise_openai_parse_output_none_typeerror():
+    source = (
+        "def parse_response():\n"
+        "    raise TypeError(\"'NoneType' object is not iterable\")\n"
+        "parse_response()\n"
+    )
+    code = compile(
+        source,
+        "/venv/lib/python3.12/site-packages/openai/lib/_parsing/_responses.py",
+        "exec",
+    )
+    exec(code, {})
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Strip provider env vars so each test starts clean."""
@@ -2194,6 +2208,214 @@ class TestCodexAuxiliaryAdapterTimeout:
             )
 
         assert time.monotonic() - started < 0.14
+
+    def test_enforces_total_timeout_inside_create_stream_fallback(self):
+        class ParserBugStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                _raise_openai_parse_output_none_typeerror()
+
+            def get_final_response(self):  # pragma: no cover - parser raises first
+                return SimpleNamespace(output=None, usage=None)
+
+        class SlowFallbackStream:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                for _ in range(5):
+                    time.sleep(0.03)
+                    yield SimpleNamespace(type="response.in_progress")
+
+            def close(self):
+                self.closed = True
+
+        fallback_stream = SlowFallbackStream()
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return ParserBugStream()
+
+            def create(self, **kwargs):
+                assert kwargs.get("stream") is True
+                return fallback_stream
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=0.05,
+            )
+
+        assert fallback_stream.closed is True
+        assert time.monotonic() - started < 0.14
+
+
+class TestCodexAuxiliaryAdapterOutputNoneParserRecovery:
+    def test_synthesizes_text_when_stream_parser_fails_after_deltas(self):
+        class ParserBugAfterDeltasStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="title ")
+                yield SimpleNamespace(type="response.output_text.delta", delta="ok")
+                _raise_openai_parse_output_none_typeerror()
+
+            def get_final_response(self):  # pragma: no cover - parser raises first
+                return SimpleNamespace(output=None, usage=None)
+
+        calls = {"create": 0}
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return ParserBugAfterDeltasStream()
+
+            def create(self, **kwargs):
+                calls["create"] += 1
+                return SimpleNamespace(output=[], usage=None)
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(responses=FakeResponses(), close=lambda: None),
+            "gpt-5.5",
+        )
+
+        response = adapter.create(messages=[{"role": "user", "content": "title"}])
+
+        assert calls["create"] == 0
+        assert response.choices[0].message.content == "title ok"
+
+    def test_returns_collected_output_item_when_stream_parser_fails(self):
+        output_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="collected title")],
+        )
+
+        class ParserBugAfterOutputItemStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_item.done", item=output_item)
+                _raise_openai_parse_output_none_typeerror()
+
+            def get_final_response(self):  # pragma: no cover - parser raises first
+                return SimpleNamespace(output=None, usage=None)
+
+        calls = {"create": 0}
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return ParserBugAfterOutputItemStream()
+
+            def create(self, **kwargs):
+                calls["create"] += 1
+                return SimpleNamespace(output=[], usage=None)
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(responses=FakeResponses(), close=lambda: None),
+            "gpt-5.5",
+        )
+
+        response = adapter.create(messages=[{"role": "user", "content": "title"}])
+
+        assert calls["create"] == 0
+        assert response.choices[0].message.content == "collected title"
+
+    def test_falls_back_to_create_stream_when_parser_fails_without_parts(self):
+        class ParserBugStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                _raise_openai_parse_output_none_typeerror()
+
+            def get_final_response(self):  # pragma: no cover - parser raises first
+                return SimpleNamespace(output=None, usage=None)
+
+        class CreateStream:
+            closed = False
+
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.output_text.delta", delta="fallback title"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(output=None, usage=None),
+                    ),
+                ])
+
+            def close(self):
+                self.closed = True
+
+        create_stream = CreateStream()
+        calls = {"create": 0}
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return ParserBugStream()
+
+            def create(self, **kwargs):
+                calls["create"] += 1
+                assert kwargs.get("stream") is True
+                return create_stream
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(responses=FakeResponses(), close=lambda: None),
+            "gpt-5.5",
+        )
+
+        response = adapter.create(messages=[{"role": "user", "content": "title"}])
+
+        assert calls["create"] == 1
+        assert create_stream.closed is True
+        assert response.choices[0].message.content == "fallback title"
+
+    def test_unrelated_typeerror_still_raises(self):
+        class BadStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                raise TypeError("unexpected argument")
+
+            def get_final_response(self):
+                return SimpleNamespace(output=[], usage=None)
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return BadStream()
+
+            def create(self, **kwargs):
+                raise AssertionError("create fallback should not run")
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(responses=FakeResponses(), close=lambda: None),
+            "gpt-5.5",
+        )
+
+        with pytest.raises(TypeError, match="unexpected argument"):
+            adapter.create(messages=[{"role": "user", "content": "title"}])
 
 
 # ---------------------------------------------------------------------------
