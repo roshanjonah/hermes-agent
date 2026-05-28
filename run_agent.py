@@ -5831,9 +5831,13 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        if messages is None:
+            session_messages = getattr(self, "_session_messages", None)
+            messages = session_messages if isinstance(session_messages, list) else []
+
         if self._memory_manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                self._memory_manager.on_session_end(messages)
             except Exception:
                 pass
             try:
@@ -5845,7 +5849,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    messages,
                 )
             except Exception:
                 pass

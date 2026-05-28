@@ -333,7 +333,26 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    try:
+        return agent.chat(prompt) or ""
+    finally:
+        _shutdown_oneshot_agent(agent)
+
+
+def _shutdown_oneshot_agent(agent: object) -> None:
+    """Close agent-scoped resources before oneshot process shutdown."""
+    try:
+        shutdown = getattr(agent, "shutdown_memory_provider", None)
+        if callable(shutdown):
+            shutdown()
+    except Exception as exc:
+        logging.debug("Oneshot memory shutdown failed: %s", exc)
+    try:
+        close = getattr(agent, "close", None)
+        if callable(close):
+            close()
+    except Exception as exc:
+        logging.debug("Oneshot agent close failed: %s", exc)
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

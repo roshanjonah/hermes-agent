@@ -1,20 +1,15 @@
-"""Regression tests for #15165 — gateway session shutdown must pass the
-agent's conversation transcript to ``shutdown_memory_provider`` so memory
-providers' ``on_session_end`` hooks see the real messages instead of an
-empty list.
+"""Regression tests for #15165 — gateway session shutdown must invoke the
+agent-owned memory shutdown path so providers see the real messages instead
+of an empty list.
 
-Before the fix, ``_cleanup_agent_resources`` called
-``agent.shutdown_memory_provider()`` with no arguments, which in turn
-invoked ``on_session_end([])`` on every memory provider. Providers with
+Before the fix, no-arg ``AIAgent.shutdown_memory_provider()`` invoked
+``on_session_end([])`` on every memory provider. Providers with
 an empty-guard (Holographic, Hindsight, etc.) exited early and never
 persisted the session's facts, so the next gateway start-up surfaced no
 memories from the prior conversation.
 
-The fix reads ``agent._session_messages`` (set on ``AIAgent.__init__``
-and refreshed every turn via ``_persist_session``) and forwards it to
-``shutdown_memory_provider``. Test stubs built via ``object.__new__``
-or plain ``MagicMock()`` still exercise the legacy no-arg path, so the
-change is backward-compatible with existing suites.
+The fix is that ``AIAgent.shutdown_memory_provider()`` owns the default
+transcript lookup. Gateway only calls the public cleanup method.
 """
 
 from __future__ import annotations
@@ -56,12 +51,12 @@ class _FakeAgent:
         self.close = MagicMock()
 
 
-class TestCleanupAgentResourcesPassesMessages:
-    """_cleanup_agent_resources forwards the agent's session messages."""
+class TestCleanupAgentResourcesInvokesShutdown:
+    """_cleanup_agent_resources invokes the agent cleanup contract."""
 
-    def test_populated_messages_forwarded(self):
-        """Real-world path: an agent that ran a turn has a populated
-        ``_session_messages`` list and the cleanup call forwards it."""
+    def test_agent_with_messages_uses_public_shutdown(self):
+        """Real-world path: an agent that ran a turn is cleaned up through
+        the public shutdown method."""
         runner = _make_runner()
         transcript = [
             {"role": "user", "content": "remember my dog is named Biscuit"},
@@ -71,28 +66,20 @@ class TestCleanupAgentResourcesPassesMessages:
 
         runner._cleanup_agent_resources(agent)
 
-        # The fix must call shutdown_memory_provider with the exact list
-        # identity — providers iterate it to extract facts.
-        agent.shutdown_memory_provider.assert_called_once_with(transcript)
+        agent.shutdown_memory_provider.assert_called_once_with()
 
-    def test_empty_list_still_forwarded(self):
-        """An agent that initialised but ran no turns has an empty list
-        on ``_session_messages``. Forwarding it (rather than falling
-        through to the no-arg path) makes the absence of content
-        explicit to providers and matches the pre-fix observable
-        behaviour (``on_session_end([])``)."""
+    def test_empty_session_uses_public_shutdown(self):
+        """An agent that initialised but ran no turns still uses the same
+        public shutdown method."""
         runner = _make_runner()
         agent = _FakeAgent(session_messages=[])
 
         runner._cleanup_agent_resources(agent)
 
-        agent.shutdown_memory_provider.assert_called_once_with([])
+        agent.shutdown_memory_provider.assert_called_once_with()
 
-    def test_missing_attribute_falls_back_to_no_arg(self):
-        """Test stubs built via ``object.__new__(AIAgent)`` skip
-        ``__init__`` and therefore have no ``_session_messages``
-        attribute. The fix must not explode — it falls back to the
-        legacy no-arg call so existing suites keep passing."""
+    def test_missing_attribute_uses_public_shutdown(self):
+        """Partial test stubs without session state still shut down cleanly."""
         runner = _make_runner()
         agent = _FakeAgent(session_messages=None)  # attribute not set
 
@@ -100,11 +87,9 @@ class TestCleanupAgentResourcesPassesMessages:
 
         agent.shutdown_memory_provider.assert_called_once_with()
 
-    def test_non_list_attribute_falls_back_to_no_arg(self):
-        """A MagicMock-based agent auto-synthesises ``_session_messages``
-        as a nested MagicMock. ``isinstance(mock, list)`` is False, so
-        we fall back to the no-arg path rather than passing a garbage
-        value to providers that expect ``List[Dict]``."""
+    def test_mock_agent_uses_public_shutdown(self):
+        """MagicMock agents should be cleaned up without inspecting private
+        transcript attributes."""
         runner = _make_runner()
         agent = MagicMock()
         # No explicit _session_messages assignment — MagicMock will
