@@ -1,7 +1,7 @@
 # Docs workflow Node pins — 2026-10-24
 
 Pin both docs builders to the approved Node `22.23.4` target from base
-`9feadc273433e6afdfcb68ac912ba5aff46b7114`.
+`1fdddacfb92224b2617d41b59e6ac2a9a7fe39e3`.
 
 - `.github/workflows/deploy-site.yml:42`: `20` → `22.23.4`.
 - `.github/workflows/docs-site-checks.yml:21`: `20` → `22.23.4`.
@@ -15,6 +15,9 @@ job remains upstream-only (`deploy-site.yml:32`); this fork PR grants no
 publication or deployment authority.
 
 ## Validation and status
+
+Refreshed by normal merge of `main` after the independent fixture correction in
+PR2. The docs PR diff remains the two workflow pins and this evidence file.
 
 Local validation command: `git diff --check`. Native PR checks provide the
 install/build result; this source document makes no claim about a future run.
